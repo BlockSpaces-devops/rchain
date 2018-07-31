@@ -9,6 +9,7 @@ lazy val projectSettings = Seq(
   scalaVersion := "2.12.4",
   version := "0.1.0-SNAPSHOT",
   resolvers ++= Seq(
+    // Resolver.mavenLocal,
     Resolver.sonatypeRepo("releases"),
     Resolver.sonatypeRepo("snapshots")),
   scalafmtOnCompile := true
