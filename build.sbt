@@ -143,7 +143,8 @@ lazy val node = (project in file("node"))
         oldStrategy(x)
     },
     /* Dockerization */
-    dockerUsername := Some(organization.value),
+    dockerUsername := Some("kayvank"),
+    dockerRepository := Some("kayvank"),
     dockerUpdateLatest := true,
     dockerBaseImage := "openjdk:8u171-jre-slim-stretch",
     dockerCommands := {
@@ -362,3 +363,5 @@ lazy val rchain = (project in file("."))
     rspaceBench,
     shared
   )
+
+dockerRepository := Some("kayvank")
