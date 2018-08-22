@@ -3,6 +3,7 @@ package coop.rchain.node.api
 import coop.rchain.node.diagnostics
 import coop.rchain.p2p.effects._
 import io.grpc.{Server, ServerBuilder}
+import io.grpc.netty.NettyServerBuilder
 
 import scala.concurrent.Future
 import cats._
@@ -12,7 +13,7 @@ import com.google.protobuf.empty.Empty
 import coop.rchain.casper.{MultiParentCasperConstructor, PrettyPrinter, SafetyOracle}
 import coop.rchain.casper.protocol._
 import coop.rchain.casper.util.ProtoUtil
-import coop.rchain.casper.protocol.{Deploy, DeployServiceGrpc, DeployServiceResponse, DeployString}
+import coop.rchain.casper.protocol.{Deploy, DeployServiceGrpc, DeployServiceResponse}
 import coop.rchain.casper.util.rholang.InterpreterUtil
 import coop.rchain.catscontrib._
 import Catscontrib._
@@ -38,22 +39,32 @@ object GrpcServer {
 
   private implicit val logSource: LogSource = LogSource(this.getClass)
 
-  def acquireServer[
-      F[_]: Capture: Monad: MultiParentCasperConstructor: Log: NodeDiscovery: JvmMetrics: NodeMetrics: Futurable: SafetyOracle: BlockStore](
+  def acquireInternalServer[
+      F[_]: Capture: Functor: NodeDiscovery: JvmMetrics: NodeMetrics: Futurable](
       port: Int,
       runtime: Runtime)(implicit scheduler: Scheduler): F[Server] =
     Capture[F].capture {
-      ServerBuilder
+      NettyServerBuilder
         .forPort(port)
         .addService(ReplGrpc.bindService(new ReplGrpcService(runtime), scheduler))
         .addService(DiagnosticsGrpc.bindService(diagnostics.grpc[F], scheduler))
+        .build
+    }
+
+  def acquireExternalServer[
+      F[_]: Capture: Monad: MultiParentCasperConstructor: Log: SafetyOracle: BlockStore: Futurable](
+      port: Int)(implicit scheduler: Scheduler): F[Server] =
+    Capture[F].capture {
+      NettyServerBuilder
+        .forPort(port)
         .addService(DeployServiceGrpc.bindService(new DeployGrpcService[F], scheduler))
         .build
     }
 
-  def start[F[_]: FlatMap: Capture: Log](server: Server): F[Unit] =
+  def start[F[_]: FlatMap: Capture: Log](serverExternal: Server, serverInternal: Server): F[Unit] =
     for {
-      _ <- Capture[F].capture(server.start)
+      _ <- Capture[F].capture(serverExternal.start)
+      _ <- Capture[F].capture(serverInternal.start)
       _ <- Log[F].info("gRPC server started, listening on ")
     } yield ()
 

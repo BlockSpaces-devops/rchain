@@ -1,6 +1,10 @@
 package coop.rchain.casper
 
 sealed trait BlockStatus
+
+case object Processing                   extends BlockStatus
+case class BlockException(ex: Throwable) extends BlockStatus
+
 sealed trait ValidBlock   extends BlockStatus
 sealed trait InvalidBlock extends BlockStatus
 sealed trait Slashable
@@ -23,6 +27,7 @@ case object InvalidBlockNumber      extends InvalidBlock with Slashable
 case object InvalidRepeatDeploy     extends InvalidBlock with Slashable
 case object InvalidParents          extends InvalidBlock with Slashable
 case object InvalidSequenceNumber   extends InvalidBlock with Slashable
+case object InvalidShardId          extends InvalidBlock with Slashable
 case object JustificationRegression extends InvalidBlock with Slashable
 case object NeglectedInvalidBlock   extends InvalidBlock with Slashable
 case object NeglectedEquivocation   extends InvalidBlock with Slashable
@@ -30,5 +35,7 @@ case object InvalidTransaction      extends InvalidBlock with Slashable
 case object InvalidBondsCache       extends InvalidBlock with Slashable
 
 object BlockStatus {
-  def valid: BlockStatus = Valid
+  def valid: BlockStatus                    = Valid
+  def processing: BlockStatus               = Processing
+  def exception(ex: Throwable): BlockStatus = BlockException(ex)
 }

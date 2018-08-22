@@ -4,17 +4,11 @@ import cats.data.{OptionT, State, StateT}
 import cats.implicits._
 import coop.rchain.models.Channel.ChannelInstance.{ChanVar, Quote}
 import coop.rchain.models.Connective.ConnectiveInstance
-import coop.rchain.models.Connective.ConnectiveInstance.{
-  ConnAndBody,
-  ConnNotBody,
-  ConnOrBody,
-  VarRefBody
-}
+import coop.rchain.models.Connective.ConnectiveInstance._
 import coop.rchain.models.Expr.ExprInstance._
 import coop.rchain.models.Var.VarInstance.{BoundVar, FreeVar, Wildcard}
 import coop.rchain.models._
 import coop.rchain.models.rholang.implicits.{VectorPar, _}
-import coop.rchain.rholang.interpreter.matcher.StreamT
 import coop.rchain.rholang.interpreter.matcher.StreamT._
 import coop.rchain.rholang.interpreter.accounting.CostAccount
 import coop.rchain.rholang.interpreter.matcher.SpatialMatcher._
@@ -220,6 +214,17 @@ object SpatialMatcher extends SpatialMatcherInstances {
         spatialMatch(t, p).flatMap(_ => foldMatch(trem, prem, remainder))
     }
 
+  def listMatchSingle[T](tlist: Seq[T], plist: Seq[T])(
+      implicit lf: HasLocallyFree[T],
+      sm: SpatialMatcher[T, T]): OptionalFreeMapWithCost[Unit] =
+    listMatchSingleNonDet(tlist, plist, (p: Par, _: T) => p, None, false)
+      .mapK[OptionT[State[CostAccount, ?], ?]](
+        new FunctionK[StreamT[State[CostAccount, ?], ?], OptionT[State[CostAccount, ?], ?]] {
+          override def apply[A](
+              fa: StreamT[State[CostAccount, ?], A]): OptionT[State[CostAccount, ?], A] =
+            OptionT(fa.value.map(_.headOption))
+        })
+
   /** This function finds a single matching from a list of patterns and a list of targets.
     * Any remaining terms are either grouped with the free variable varLevel or thrown away with the wildcard.
     * If both are provided, we prefer to capture terms that can be captured.
@@ -244,41 +249,23 @@ object SpatialMatcher extends SpatialMatcherInstances {
     val exactMatch = !wildcard && varLevel.isEmpty
     val plen       = plist.length
     val tlen       = tlist.length
-    if (exactMatch && plen != tlen)
-      NonDetFreeMapWithCost.emptyMap[Unit].modifyCost(_.charge(COMPARISON_COST))
-    else if (plen > tlen)
-      NonDetFreeMapWithCost.emptyMap[Unit].modifyCost(_.charge(COMPARISON_COST))
-    else
-      // This boundary is very similar to Oleg's once.
-      listMatch(tlist, plist, merger, varLevel, wildcard)
-        .transformF[StreamT[State[CostAccount, ?], ?], Unit, FreeMap](streamT =>
-          StreamT(streamT.value.map[Stream[(FreeMap, Unit)]] {
-            case Stream.Empty => Stream.Empty
-            case head #:: _   => Stream(head)
-          }))
-  }
 
-  def listMatchSingle[T](tlist: Seq[T],
-                         plist: Seq[T],
-                         merger: (Par, T) => Par,
-                         varLevel: Option[Int],
-                         wildcard: Boolean)(
-      implicit lf: HasLocallyFree[T],
-      sm: SpatialMatcher[T, T]): OptionalFreeMapWithCost[Unit] =
-    listMatchSingleNonDet(tlist, plist, merger, varLevel, wildcard)
-      .mapK[OptionT[State[CostAccount, ?], ?]](
-        new FunctionK[StreamT[State[CostAccount, ?], ?], OptionT[State[CostAccount, ?], ?]] {
-          override def apply[A](
-              fa: StreamT[State[CostAccount, ?], A]): OptionT[State[CostAccount, ?], A] =
-            OptionT(fa.value.map(_.headOption))
-        })
+    val result =
+      if (exactMatch && plen != tlen)
+        NonDetFreeMapWithCost.emptyMap[Unit].modifyCost(_.charge(COMPARISON_COST))
+      else if (plen > tlen)
+        NonDetFreeMapWithCost.emptyMap[Unit].modifyCost(_.charge(COMPARISON_COST))
+      else if (plen == 0 && tlen == 0 && varLevel.isEmpty)
+        NonDetFreeMapWithCost.pure(())
+      else
+        listMatch(tlist, plist, merger, varLevel, wildcard)
+          .transformF[StreamT[State[CostAccount, ?], ?], Unit, FreeMap](streamT =>
+            StreamT(streamT.value.map[Stream[(FreeMap, Unit)]] {
+              case Stream.Empty => Stream.Empty
+              case head #:: _   => Stream(head)
+            }))
 
-  private[this] def possiblyRemove[T](needle: T, haystack: Seq[T]): Option[Seq[T]] = {
-    val (before, after) = haystack.span(x => x != needle)
-    after match {
-      case Nil       => None
-      case _ +: tail => Some(before ++ tail)
-    }
+    result
   }
 
   def listMatch[T](tlist: Seq[T],
@@ -302,26 +289,7 @@ object SpatialMatcher extends SpatialMatcherInstances {
           // If there's a capture variable, we prefer to add things to that rather than throw them
           // away.
           case Some(level) => {
-            // This function is essentially an early terminating left fold.
-            @tailrec
-            def foldRemainder(remainder: Seq[T], p: Par): NonDetFreeMapWithCost[Par] =
-              remainder match {
-                case Nil => NonDetFreeMapWithCost.pure(p)
-                case item +: rem =>
-                  if (lf.locallyFree(item, 0).isEmpty)
-                    foldRemainder(rem, merger(p, item))
-                  else if (wildcard)
-                    foldRemainder(rem, p)
-                  else
-                    NonDetFreeMapWithCost.emptyMap[Par]
-              }
-            for {
-              p <- StateT.inspect[StreamT[State[CostAccount, ?], ?], FreeMap, Par]((m: FreeMap) =>
-                    m.getOrElse(level, VectorPar()))
-              collectPar <- foldRemainder(rem.reverse, p)
-              _ <- StateT.modify[StreamT[State[CostAccount, ?], ?], FreeMap]((m: FreeMap) =>
-                    m + (level -> collectPar))
-            } yield Unit
+            handleRemainder(rem, level, merger, wildcard)
           }
         }
       // Try to find a match for a single pattern.
@@ -341,17 +309,41 @@ object SpatialMatcher extends SpatialMatcherInstances {
       }
     }
 
-  /** TODO(mateusz.gorski): Consider moving this inside [[listMatchItem]]
-    */
-  def singleOut[A](vals: Seq[A]): Seq[(Seq[A], A, Seq[A])] =
-    vals.tails
-      .foldLeft((Seq[A](), Seq[(Seq[A], A, Seq[A])]())) {
-        case ((head, singled: Seq[(Seq[A], A, Seq[A])]), Nil) => (head, singled)
-        case ((head, singled: Seq[(Seq[A], A, Seq[A])]), elem +: tail) =>
-          (elem +: head, (head, elem, tail) +: singled)
+  private def handleRemainder[T](rem: Seq[T],
+                                 level: Int,
+                                 merger: (Par, T) => Par,
+                                 wildcard: Boolean)(
+      implicit lf: HasLocallyFree[T],
+      sm: SpatialMatcher[T, T]): NonDetFreeMapWithCost[Unit] = {
+    // This function is essentially an early terminating left fold.
+    @tailrec
+    def foldRemainder(remainder: Seq[T], p: Par): NonDetFreeMapWithCost[Par] =
+      remainder match {
+        case Nil => NonDetFreeMapWithCost.pure(p)
+        case item +: rem =>
+          if (lf.locallyFree(item, 0).isEmpty)
+            foldRemainder(rem, merger(p, item))
+          else if (wildcard)
+            foldRemainder(rem, p)
+          else
+            NonDetFreeMapWithCost.emptyMap[Par]
       }
-      ._2
-      .reverse
+    for {
+      p <- StateT.inspect[StreamT[State[CostAccount, ?], ?], FreeMap, Par]((m: FreeMap) =>
+            m.getOrElse(level, VectorPar()))
+      collectPar <- foldRemainder(rem.reverse, p)
+      _ <- StateT.modify[StreamT[State[CostAccount, ?], ?], FreeMap]((m: FreeMap) =>
+            m + (level -> collectPar))
+    } yield Unit
+  }
+
+  private[this] def possiblyRemove[T](needle: T, haystack: Seq[T]): Option[Seq[T]] = {
+    val (before, after) = haystack.span(x => x != needle)
+    after match {
+      case Nil       => None
+      case _ +: tail => Some(before ++ tail)
+    }
+  }
 
   def listMatchItem[T](
       tlist: Seq[T],
@@ -369,6 +361,18 @@ object SpatialMatcher extends SpatialMatcherInstances {
                             (cost, Stream((state, head.reverse ++ tail)))
                       })))
     } yield forcedYield
+
+  /** TODO(mateusz.gorski): Consider moving this inside [[listMatchItem]]
+    */
+  def singleOut[A](vals: Seq[A]): Seq[(Seq[A], A, Seq[A])] =
+    vals.tails
+      .foldLeft((Seq[A](), Seq[(Seq[A], A, Seq[A])]())) {
+        case ((head, singled: Seq[(Seq[A], A, Seq[A])]), Nil) => (head, singled)
+        case ((head, singled: Seq[(Seq[A], A, Seq[A])]), elem +: tail) =>
+          (elem +: head, (head, elem, tail) +: singled)
+      }
+      ._2
+      .reverse
 
   case class ParCount(sends: Int = 0,
                       receives: Int = 0,
@@ -462,6 +466,11 @@ object SpatialMatcher extends SpatialMatcherInstances {
           // Variable references should be substituted before going into the matcher.
           // This should never happen.
           (ParCount(), ParCount())
+        case _: ConnBool      => (ParCount(exprs = 1), ParCount(exprs = 1))
+        case _: ConnInt       => (ParCount(exprs = 1), ParCount(exprs = 1))
+        case _: ConnString    => (ParCount(exprs = 1), ParCount(exprs = 1))
+        case _: ConnUri       => (ParCount(exprs = 1), ParCount(exprs = 1))
+        case _: ConnByteArray => (ParCount(exprs = 1), ParCount(exprs = 1))
       }
   }
 }
@@ -505,6 +514,41 @@ trait SpatialMatcherInstances {
         case _: VarRefBody =>
           // this should never happen because variable references should be substituted
           OptionalFreeMapWithCost.emptyMap[Unit]
+
+        case _: ConnBool =>
+          target.singleExpr match {
+            case Some(Expr(GBool(_))) =>
+              OptionalFreeMapWithCost.pure(())
+            case _ => OptionalFreeMapWithCost.emptyMap[Unit]
+          }
+
+        case _: ConnInt =>
+          target.singleExpr match {
+            case Some(Expr(GInt(_))) =>
+              OptionalFreeMapWithCost.pure(())
+            case _ => OptionalFreeMapWithCost.emptyMap[Unit]
+          }
+
+        case _: ConnString =>
+          target.singleExpr match {
+            case Some(Expr(GString(_))) =>
+              OptionalFreeMapWithCost.pure(())
+            case _ => OptionalFreeMapWithCost.emptyMap[Unit]
+          }
+
+        case _: ConnUri =>
+          target.singleExpr match {
+            case Some(Expr(GUri(_))) =>
+              OptionalFreeMapWithCost.pure(())
+            case _ => OptionalFreeMapWithCost.emptyMap[Unit]
+          }
+
+        case _: ConnByteArray =>
+          target.singleExpr match {
+            case Some(Expr(GByteArray(_))) =>
+              OptionalFreeMapWithCost.pure(())
+            case _ => OptionalFreeMapWithCost.emptyMap[Unit]
+          }
 
         case ConnectiveInstance.Empty =>
           OptionalFreeMapWithCost.emptyMap[Unit]
@@ -652,7 +696,7 @@ trait SpatialMatcherInstances {
         OptionalFreeMapWithCost.emptyMap[Unit].modifyCost(_.charge(COMPARISON_COST))
       else
         for {
-          _ <- listMatchSingle[ReceiveBind](target.binds, pattern.binds, (p, rb) => p, None, false)
+          _ <- listMatchSingle[ReceiveBind](target.binds, pattern.binds)
           _ <- spatialMatch(target.body, pattern.body)
         } yield Unit
     }
@@ -712,6 +756,11 @@ trait SpatialMatcherInstances {
             _ <- spatialMatch(t2, p2)
           } yield Unit
         case (EPlusPlusBody(EPlusPlus(t1, t2)), EPlusPlusBody(EPlusPlus(p1, p2))) =>
+          for {
+            _ <- spatialMatch(t1, p1)
+            _ <- spatialMatch(t2, p2)
+          } yield Unit
+        case (EMinusMinusBody(EMinusMinus(t1, t2)), EMinusMinusBody(EMinusMinus(p1, p2))) =>
           for {
             _ <- spatialMatch(t1, p1)
             _ <- spatialMatch(t2, p2)

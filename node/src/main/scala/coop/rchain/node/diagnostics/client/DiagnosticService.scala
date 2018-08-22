@@ -1,5 +1,8 @@
 package coop.rchain.node.diagnostics.client
 
+import java.io.Closeable
+import java.util.concurrent.TimeUnit
+
 import coop.rchain.comm._
 import coop.rchain.node.model.diagnostics._
 
@@ -21,7 +24,9 @@ object DiagnosticsService {
   def apply[F[_]](implicit ev: DiagnosticsService[F]): DiagnosticsService[F] = ev
 }
 
-class GrpcDiagnosticsService(host: String, port: Int) extends DiagnosticsService[Task] {
+class GrpcDiagnosticsService(host: String, port: Int)
+    extends DiagnosticsService[Task]
+    with Closeable {
 
   private val channel: ManagedChannel =
     ManagedChannelBuilder.forAddress(host, port).usePlaintext(true).build
@@ -57,4 +62,14 @@ class GrpcDiagnosticsService(host: String, port: Int) extends DiagnosticsService
 
   def threads: Task[Threads] =
     Task.delay(blockingStub.getThreads(Empty()))
+
+  override def close(): Unit = {
+    val terminated = channel.shutdown().awaitTermination(10, TimeUnit.SECONDS)
+    if (!terminated) {
+      println(
+        "warn: did not shutdown after 10 seconds, retrying with additional 10 seconds timeout")
+      channel.awaitTermination(10, TimeUnit.SECONDS)
+    }
+  }
+
 }

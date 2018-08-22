@@ -64,6 +64,7 @@ lazy val comm = (project in file("comm"))
     version := "0.1",
     libraryDependencies ++= commonDependencies ++ kamonDependencies ++ protobufDependencies ++ Seq(
       grpcNetty,
+      nettyBoringSsl,
       scalapbRuntimegGrpc,
       scalaUri,
       weupnp,
@@ -114,7 +115,7 @@ lazy val node = (project in file("node"))
   .settings(commonSettings: _*)
   .enablePlugins(RpmPlugin, DebianPlugin, JavaAppPackaging, BuildInfoPlugin)
   .settings(
-    version := "0.5.3",
+    version := "0.6.1",
     name := "rnode",
     maintainer := "Pyrofex, Inc. <info@pyrofex.net>",
     packageSummary := "RChain Node",
@@ -123,11 +124,11 @@ lazy val node = (project in file("node"))
       apiServerDependencies ++ commonDependencies ++ kamonDependencies ++ protobufDependencies ++ Seq(
         catsCore,
         grpcNetty,
-        nettyBoringSsl,
         jline,
         scallop,
         scalaUri,
-        scalapbRuntimegGrpc
+        scalapbRuntimegGrpc,
+        tomlScala
       ),
     PB.targets in Compile := Seq(
       PB.gens.java                        -> (sourceManaged in Compile).value / "protobuf",
@@ -143,7 +144,8 @@ lazy val node = (project in file("node"))
         oldStrategy(x)
     },
     /* Dockerization */
-    dockerUsername := Some(organization.value),
+    dockerUsername := Some("kayvank"),
+    dockerRepository := Some("kayvank"),
     dockerUpdateLatest := true,
     dockerBaseImage := "openjdk:8u171-jre-slim-stretch",
     dockerCommands := {
@@ -362,3 +364,5 @@ lazy val rchain = (project in file("."))
     rspaceBench,
     shared
   )
+
+dockerRepository := Some("kayvank")

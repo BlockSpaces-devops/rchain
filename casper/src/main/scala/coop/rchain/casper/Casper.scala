@@ -1,10 +1,10 @@
 package coop.rchain.casper
 
+import coop.rchain.comm.rp.Connect.{ConnectionsCell, RPConfAsk}
 import cats.{Applicative, Id, Monad}
 import cats.implicits._
-import cats.effect.Bracket
+import cats.effect.{Bracket, Sync}
 import com.google.protobuf.ByteString
-import coop.rchain.blockstorage.InMemBlockStore
 import coop.rchain.catscontrib.TaskContrib._
 import coop.rchain.casper.genesis.Genesis
 import coop.rchain.casper.protocol._
@@ -31,12 +31,14 @@ import scala.io.Source
 import scala.util.Try
 import java.nio.file.Path
 
+import cats.effect.concurrent.Ref
 import cats.mtl.MonadState
 import coop.rchain.blockstorage.BlockStore
 import coop.rchain.blockstorage.BlockStore.BlockHash
 import coop.rchain.casper.EquivocationRecord.SequenceNumber
 import coop.rchain.casper.Estimator.{BlockHash, Validator}
 import coop.rchain.casper.util.rholang.RuntimeManager.StateHash
+import coop.rchain.models.Par
 import coop.rchain.rspace.{trace, Checkpoint}
 import coop.rchain.rspace.trace.{COMM, Event}
 import coop.rchain.rspace.trace.Event.codecLog
@@ -49,7 +51,7 @@ import scodec.bits.BitVector
 trait Casper[F[_], A] {
   def addBlock(b: BlockMessage): F[BlockStatus]
   def contains(b: BlockMessage): F[Boolean]
-  def deploy(d: Deploy): F[Unit]
+  def deploy(d: DeployData): F[Either[Throwable, Unit]]
   def estimator: F[A]
   def createBlock: F[Option[BlockMessage]]
 }
@@ -60,7 +62,10 @@ trait MultiParentCasper[F[_]] extends Casper[F, IndexedSeq[BlockMessage]] {
   // We want the clique oracle to give us a fault tolerance that is greater than
   // this initial fault weight combined with our fault tolerance threshold t.
   def normalizedInitialFault(weights: Map[Validator, Int]): F[Float]
+  def lastFinalizedBlock: F[BlockMessage]
   def storageContents(hash: ByteString): F[String]
+  // TODO: Refactor hashSetCasper to take a RuntimeManager[F] just like BlockStore[F]
+  def getRuntimeManager: F[Option[RuntimeManager]]
 }
 
 object MultiParentCasper extends MultiParentCasperInstances {
@@ -71,27 +76,13 @@ sealed abstract class MultiParentCasperInstances {
 
   private implicit val logSource: LogSource = LogSource(this.getClass)
 
-  def noOpsCasper[F[_]: Applicative]: MultiParentCasper[F] =
-    new MultiParentCasper[F] {
-      def addBlock(b: BlockMessage): F[BlockStatus] = BlockStatus.valid.pure[F]
-      def contains(b: BlockMessage): F[Boolean]     = false.pure[F]
-      def deploy(r: Deploy): F[Unit]                = ().pure[F]
-      def estimator: F[IndexedSeq[BlockMessage]] =
-        Applicative[F].pure[IndexedSeq[BlockMessage]](Vector(BlockMessage()))
-      def createBlock: F[Option[BlockMessage]]                           = Applicative[F].pure[Option[BlockMessage]](None)
-      def blockDag: F[BlockDag]                                          = BlockDag().pure[F]
-      def normalizedInitialFault(weights: Map[Validator, Int]): F[Float] = 0f.pure[F]
-      def storageContents(hash: ByteString): F[String]                   = "".pure[F]
-    }
-
-  // TODO: Add Sync as a constraint to ensure stack safe-ness
   def hashSetCasper[
-      F[_]: Monad: Capture: NodeDiscovery: TransportLayer: Log: Time: ErrorHandler: SafetyOracle: BlockStore](
+      F[_]: Sync: Monad: Capture: ConnectionsCell: TransportLayer: Log: Time: ErrorHandler: SafetyOracle: BlockStore: RPConfAsk](
       runtimeManager: RuntimeManager,
       validatorId: Option[ValidatorIdentity],
       genesis: BlockMessage,
-      internalMap: Map[BlockHash, BlockMessage])(
-      implicit scheduler: Scheduler): MultiParentCasper[F] = {
+      internalMap: Map[BlockHash, BlockMessage],
+      shardId: String)(implicit scheduler: Scheduler): MultiParentCasper[F] = {
     val dag = BlockDag()
     val (maybePostGenesisStateHash, _) = InterpreterUtil
       .validateBlockCheckpoint(
@@ -103,16 +94,24 @@ sealed abstract class MultiParentCasperInstances {
         Set[StateHash](runtimeManager.emptyStateHash),
         runtimeManager
       )
-    createMultiParentCasper[F](runtimeManager, validatorId, genesis, dag, maybePostGenesisStateHash)
+    createMultiParentCasper[F](
+      runtimeManager,
+      validatorId,
+      genesis,
+      dag,
+      maybePostGenesisStateHash,
+      shardId
+    )
   }
 
   private[this] def createMultiParentCasper[
-      F[_]: Monad: Capture: NodeDiscovery: TransportLayer: Log: Time: ErrorHandler: SafetyOracle: BlockStore](
+      F[_]: Sync: Monad: Capture: ConnectionsCell: TransportLayer: Log: Time: ErrorHandler: SafetyOracle: BlockStore: RPConfAsk](
       runtimeManager: RuntimeManager,
       validatorId: Option[ValidatorIdentity],
       genesis: BlockMessage,
       dag: BlockDag,
-      maybePostGenesisStateHash: Option[StateHash])(implicit scheduler: Scheduler) =
+      maybePostGenesisStateHash: Option[StateHash],
+      shardId: String)(implicit scheduler: Scheduler) =
     new MultiParentCasper[F] {
       type BlockHash = ByteString
       type Validator = ByteString
@@ -148,13 +147,51 @@ sealed abstract class MultiParentCasperInstances {
       private val invalidBlockTracker: mutable.HashSet[BlockHash] =
         new mutable.HashSet[BlockHash]()
 
+      // TODO: Extract hardcoded fault tolerance threshold
+      private val faultToleranceThreshold     = 0f
+      private val lastFinalizedBlockContainer = Ref.unsafe[F, BlockMessage](genesis)
+
+      private val processingBlocks = new AtomicSyncVar(Set.empty[BlockHash])
+
       def addBlock(b: BlockMessage): F[BlockStatus] =
         for {
+          acquire <- Capture[F].capture {
+                      processingBlocks.mapAndUpdate[(Set[BlockHash], Boolean)](
+                        blocks => {
+                          if (blocks.contains(b.blockHash)) blocks -> false
+                          else blocks                              -> true
+                        }, {
+                          case (blocks, false) => blocks
+                          case (blocks, true)  => blocks + b.blockHash
+                        }
+                      )
+                    }
+          result <- acquire match {
+                     case Right((_, false)) =>
+                       Log[F]
+                         .info(
+                           s"CASPER: Block ${PrettyPrinter.buildString(b.blockHash)} is already being processed by another thread.")
+                         .map(_ => BlockStatus.processing)
+                     case Right((_, true)) =>
+                       internalAddBlock(b).flatMap(status =>
+                         Capture[F].capture { processingBlocks.update(_ - b.blockHash); status })
+                     case Left(ex) =>
+                       Log[F]
+                         .warn(
+                           s"CASPER: Block ${PrettyPrinter.buildString(b.blockHash)} encountered an exception during processing: ${ex.getMessage}")
+                         .map(_ => BlockStatus.exception(ex))
+                   }
+        } yield result
+
+      def internalAddBlock(b: BlockMessage): F[BlockStatus] =
+        for {
+          validFormat <- Validate.formatOfFields[F](b)
           validSig    <- Validate.blockSignature[F](b)
           dag         <- blockDag
           validSender <- Validate.blockSender[F](b, genesis, dag)
           validDeploy <- Validate.repeatDeploy[F](b, genesis, dag)
-          attempt <- if (!validSig) InvalidUnslashableBlock.pure[F]
+          attempt <- if (!validFormat) InvalidUnslashableBlock.pure[F]
+                    else if (!validSig) InvalidUnslashableBlock.pure[F]
                     else if (!validSender) InvalidUnslashableBlock.pure[F]
                     else if (!validDeploy) InvalidRepeatDeploy.pure[F]
                     else attemptAdd(b)
@@ -177,24 +214,83 @@ sealed abstract class MultiParentCasperInstances {
           tip       = estimates.head
           _ <- Log[F].info(
                 s"CASPER: New fork-choice tip is block ${PrettyPrinter.buildString(tip.blockHash)}.")
+          lastFinalizedBlock        <- lastFinalizedBlockContainer.get
+          updatedLastFinalizedBlock <- updateLastFinalizedBlock(dag, lastFinalizedBlock)
+          _                         <- lastFinalizedBlockContainer.set(updatedLastFinalizedBlock)
         } yield attempt
+
+      def updateLastFinalizedBlock(dag: BlockDag,
+                                   lastFinalizedBlock: BlockMessage): F[BlockMessage] = {
+        val maybeFinalizedBlockChildren = dag.childMap.get(lastFinalizedBlock.blockHash)
+        maybeFinalizedBlockChildren match {
+          case Some(finalizedBlockChildren) =>
+            updateLastFinalizedBlockAux(dag, lastFinalizedBlock, finalizedBlockChildren.toSeq)
+          case None => lastFinalizedBlock.pure[F]
+        }
+      }
+
+      def updateLastFinalizedBlockAux(
+          dag: BlockDag,
+          lastFinalizedBlock: BlockMessage,
+          finalizedBlockCandidatesHashes: Seq[BlockHash]): F[BlockMessage] =
+        finalizedBlockCandidatesHashes match {
+          case Nil => lastFinalizedBlock.pure[F]
+          case blockHash +: rem =>
+            for {
+              maybeBlock <- BlockStore[F].get(blockHash)
+              updatedLastFinalizedBlock <- maybeBlock match {
+                                            case Some(block) =>
+                                              for {
+                                                normalizedFaultTolerance <- SafetyOracle[F]
+                                                                             .normalizedFaultTolerance(
+                                                                               dag,
+                                                                               block)
+                                                updatedLastFinalizedBlock <- if (normalizedFaultTolerance > faultToleranceThreshold) {
+                                                                              updateLastFinalizedBlock(
+                                                                                dag,
+                                                                                block)
+                                                                            } else {
+                                                                              updateLastFinalizedBlockAux(
+                                                                                dag,
+                                                                                lastFinalizedBlock,
+                                                                                rem)
+                                                                            }
+                                              } yield updatedLastFinalizedBlock
+                                            case None =>
+                                              lastFinalizedBlock.pure[F]
+                                          }
+            } yield updatedLastFinalizedBlock
+        }
 
       def contains(b: BlockMessage): F[Boolean] =
         BlockStore[F].contains(b.blockHash).map(_ || blockBuffer.contains(b))
 
-      def deploy(d: Deploy): F[Unit] =
-        for {
-          _ <- Capture[F].capture {
-                deployHist += d
-              }
-          _ <- Log[F].info(s"CASPER: Received ${PrettyPrinter.buildString(d)}")
-        } yield ()
+      def deploy(d: DeployData): F[Either[Throwable, Unit]] =
+        InterpreterUtil.mkTerm(d.term) match {
+          case Right(term) =>
+            val deploy = Deploy(
+              term = Some(term),
+              raw = Some(d)
+            )
+            for {
+              _ <- Capture[F].capture {
+                    deployHist += deploy
+                  }
+              _ <- Log[F].info(s"CASPER: Received ${PrettyPrinter.buildString(deploy)}")
+            } yield Right(())
+
+          case Left(err) =>
+            Applicative[F].pure(Left(new Exception(s"Error in parsing term: \n$err")))
+        }
 
       def estimator: F[IndexedSeq[BlockMessage]] =
         BlockStore[F].asMap() flatMap { internalMap: Map[BlockHash, BlockMessage] =>
-          Capture[F].capture {
-            Estimator.tips(_blockDag.get, internalMap, genesis)
-          }
+          for {
+            lastFinalizedBlock <- lastFinalizedBlockContainer.get
+            rankedEstimates <- Capture[F].capture {
+                                Estimator.tips(_blockDag.get, internalMap, lastFinalizedBlock)
+                              }
+          } yield rankedEstimates
         }
 
       /*
@@ -221,10 +317,14 @@ sealed abstract class MultiParentCasperInstances {
                          none[BlockMessage].pure[F]
                        }
           } yield
-            proposal.map(signBlock(_, dag, publicKey, privateKey, sigAlgorithm, vId.signFunction))
+            proposal.map(
+              signBlock(_, dag, publicKey, privateKey, sigAlgorithm, vId.signFunction, shardId)
+            )
 
         case None => none[BlockMessage].pure[F]
       }
+
+      def lastFinalizedBlock: F[BlockMessage] = lastFinalizedBlockContainer.get
 
       private def remDeploys(dag: BlockDag, p: Seq[BlockMessage]): F[Seq[Deploy]] =
         BlockStore[F].asMap() flatMap { internalMap: Map[BlockHash, BlockMessage] =>
@@ -233,7 +333,7 @@ sealed abstract class MultiParentCasperInstances {
             DagOperations
               .bfTraverse(p)(parents(_).iterator.map(internalMap))
               .foreach(b => {
-                b.body.foreach(_.newCode.foreach(result -= _))
+                b.body.foreach(_.newCode.flatMap(_.deploy).foreach(result -= _))
               })
             result.toSeq
           }
@@ -245,8 +345,8 @@ sealed abstract class MultiParentCasperInstances {
         for {
           now         <- Time[F].currentMillis
           internalMap <- BlockStore[F].asMap()
-          Right((computedCheckpoint, _)) = knownStateHashesContainer
-            .mapAndUpdate[(Checkpoint, Set[StateHash])](
+          Right((computedCheckpoint, mergeLog, _, deployWithCost)) = knownStateHashesContainer
+            .mapAndUpdate[(Checkpoint, Seq[protocol.Event], Set[StateHash], Vector[DeployCost])](
               InterpreterUtil.computeDeploysCheckpoint(p,
                                                        r,
                                                        genesis,
@@ -255,19 +355,19 @@ sealed abstract class MultiParentCasperInstances {
                                                        emptyStateHash,
                                                        _,
                                                        runtimeManager.computeState),
-              _._2)
+              _._3)
           computedStateHash = ByteString.copyFrom(computedCheckpoint.root.bytes.toArray)
-          serializedLog     = computedCheckpoint.log.map(EventConverter.toCasperEvent)
+          serializedLog     = mergeLog ++ computedCheckpoint.log.map(EventConverter.toCasperEvent)
           postState = RChainState()
             .withTuplespace(computedStateHash)
             .withBonds(bonds(p.head))
             .withBlockNumber(p.headOption.fold(0L)(blockNumber) + 1)
           body = Body()
             .withPostState(postState)
-            .withNewCode(r)
+            .withNewCode(deployWithCost)
             .withCommReductions(serializedLog)
           header = blockHeader(body, p.map(_.blockHash), version, now)
-          block  = unsignedBlockProto(body, header, justifications)
+          block  = unsignedBlockProto(body, header, justifications, shardId)
         } yield Some(block)
 
       def blockDag: F[BlockDag] = Capture[F].capture {
@@ -300,7 +400,7 @@ sealed abstract class MultiParentCasperInstances {
       private def attemptAdd(b: BlockMessage): F[BlockStatus] =
         for {
           dag                  <- Capture[F].capture { _blockDag.get }
-          postValidationStatus <- Validate.blockSummary[F](b, genesis, dag)
+          postValidationStatus <- Validate.blockSummary[F](b, genesis, dag, shardId)
           postTransactionsCheckStatus <- postValidationStatus.traverse(
                                           _ =>
                                             Validate.transactions[F](b,
@@ -631,5 +731,7 @@ sealed abstract class MultiParentCasperInstances {
                     }) *> reAttemptBuffer
               }
         } yield ()
+
+      def getRuntimeManager: F[Option[RuntimeManager]] = Applicative[F].pure(Some(runtimeManager))
     }
 }
